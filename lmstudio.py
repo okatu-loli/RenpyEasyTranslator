@@ -19,16 +19,25 @@ DEFAULT_TIMEOUT = 120
 DEFAULT_RETRIES = 3
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 0.6
-DEFAULT_MAX_TOKENS = 2048
+DEFAULT_MAX_TOKENS = 1024
 
-# Ren'Py text tags/interpolation and common printf-style placeholders.
+# Ren'Py text tags/interpolation, escaped sequences and printf-style placeholders.
+# These tokens must never be translated or modified.
 PROTECTED_TOKEN_RE = re.compile(
-    r"(\{/?[A-Za-z][^{}]*\}|\[[^\[\]\n]+\]|%(?:\([^)]+\))?[#0\- +]?(?:\d+|\*)?(?:\.\d+|\.\*)?[diouxXeEfFgGcrs%])"
+    r"(\{/?[A-Za-z][^{}]*\}|\[[^\[\]\n]+\]|%(?:\([^)]+\))?[#0\- +]?(?:\d+|\*)?(?:\.\d+|\.\*)?[diouxXeEfFgGcrs%]|\\[nrt\"\\])"
 )
 
-# String literals in translation templates. We translate only the contents of lines
-# that look like Ren'Py dialogue/string entries, leaving comments/code untouched.
-QUOTED_RE = re.compile(r'^(?P<prefix>\s*(?:old\s+|new\s+|[A-Za-z_][\w.]*\s+)?)"(?P<text>(?:\\.|[^"\\])*)"(?P<suffix>\s*)$')
+# Translation-template string lines such as:
+#     "Hello"
+#     e "Hello"
+#     old "Hello"
+#     new "Hello"
+QUOTED_RE = re.compile(
+    r'^(?P<prefix>\s*(?:old\s+|new\s+|[A-Za-z_][\w.]*\s+)?)"(?P<text>(?:\\.|[^"\\])*)"(?P<suffix>\s*)$'
+)
+
+CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+LATIN_RE = re.compile(r"[A-Za-z]")
 
 
 def http_json(method, url, payload=None, timeout=DEFAULT_TIMEOUT):
@@ -60,35 +69,24 @@ def detect_model(base_url, requested):
     result = http_json("GET", f"{base_url}/models")
     models = result.get("data", [])
     if not models:
-        raise RuntimeError("LM Studio /v1/models 没有返回已加载模型，请先在 LM Studio 中加载模型并启动 Local Server。")
+        raise RuntimeError(
+            "LM Studio /v1/models 没有返回已加载模型，请先在 LM Studio 中加载模型并启动 Local Server。"
+        )
     return models[0]["id"]
 
 
-def protect_tokens(text):
-    table = []
-
-    def repl(match):
-        token = f"⟦RET_TOKEN_{len(table):04d}⟧"
-        table.append((token, match.group(0)))
-        return token
-
-    return PROTECTED_TOKEN_RE.sub(repl, text), table
-
-
-def restore_tokens(text, table):
-    for placeholder, original in table:
-        text = text.replace(placeholder, original)
-    return text
-
-
 def decode_renpy_string(text):
-    # Keep this deliberately conservative. Ren'Py translation templates are usually
-    # ordinary escaped strings; unicode_escape would corrupt non-ASCII text.
+    # Deliberately conservative: unicode_escape would corrupt non-ASCII text.
     return text.replace(r'\"', '"').replace(r"\\", "\\")
 
 
 def encode_renpy_string(text):
-    return text.replace("\\", r"\\").replace('"', r'\"').replace("\r", "").replace("\n", r"\n")
+    return (
+        text.replace("\\", r"\\")
+        .replace('"', r'\"')
+        .replace("\r", "")
+        .replace("\n", r"\n")
+    )
 
 
 def is_source_line(line):
@@ -98,10 +96,7 @@ def is_source_line(line):
     m = QUOTED_RE.match(line)
     if not m:
         return False
-    prefix = m.group("prefix").strip()
-    # In Ren'Py generated tl files, old lines are source strings and new lines are
-    # destination strings. We should not translate the old source line itself.
-    return prefix != "old"
+    return m.group("prefix").strip() != "old"
 
 
 def collect_entries(lines):
@@ -110,12 +105,14 @@ def collect_entries(lines):
         m = QUOTED_RE.match(line)
         if not m or not is_source_line(line):
             continue
+
         prefix = m.group("prefix").strip()
         text = decode_renpy_string(m.group("text"))
         if not text.strip():
             continue
-        # Generated string translation blocks use old/new pairs. Translate only new
-        # lines when they still equal the source text or are blank.
+
+        # Generated old/new string blocks: translate the source from old, but only
+        # when new has not already been edited.
         if prefix == "new":
             previous_old = None
             for j in range(idx - 1, max(-1, idx - 5), -1):
@@ -125,61 +122,99 @@ def collect_entries(lines):
                     break
             if previous_old is not None:
                 if text.strip() and text != previous_old:
-                    # Looks already translated/edited; preserve it.
                     continue
                 text = previous_old
-        entries.append({"line": idx, "prefix": m.group("prefix"), "suffix": m.group("suffix"), "text": text})
+
+        # Allows safe resume after an interrupted run: lines already containing
+        # Chinese are treated as translated and are not sent through the model again.
+        if CJK_RE.search(text):
+            continue
+
+        entries.append(
+            {
+                "line": idx,
+                "prefix": m.group("prefix"),
+                "suffix": m.group("suffix"),
+                "text": text,
+            }
+        )
     return entries
 
 
-def build_prompt(items, target_language):
-    records = []
-    token_tables = {}
-    for i, item in enumerate(items):
-        protected, table = protect_tokens(item["text"])
-        token_tables[str(i)] = table
-        records.append({"id": i, "text": protected})
+def make_placeholders(text):
+    """Replace protected Ren'Py tokens with simple ASCII placeholders."""
+    table = []
 
-    system = (
-        "You are a professional visual novel and Ren'Py game translator. "
-        "Translate English dialogue and narration into natural, fluent Simplified Chinese. "
-        "Preserve character voice, slang, jokes, profanity, sexual implications, explicit fictional adult dialogue, "
-        "and emotional tone without censorship or euphemistic softening. "
-        "Never translate, remove, reorder, or alter placeholders such as ⟦RET_TOKEN_0000⟧. "
-        "Return valid JSON only, with exactly the same ids and one translated text for each id. "
-        "Do not add explanations."
-    )
-    user = (
-        f"Target language: {target_language}.\n"
-        "Translate the following JSON array. Return exactly an array of objects in the form "
-        '[{"id":0,"text":"..."}].\n\n' + json.dumps(records, ensure_ascii=False)
-    )
-    return system, user, token_tables
+    def repl(match):
+        marker = f"__RET_{len(table):04d}__"
+        table.append((marker, match.group(0)))
+        return marker
+
+    return PROTECTED_TOKEN_RE.sub(repl, text), table
 
 
-def parse_json_response(content):
-    content = content.strip()
+def clean_model_output(content):
+    content = str(content).strip()
+
     if content.startswith("```"):
-        content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.I)
+        content = re.sub(r"^```(?:text|txt|json)?\s*", "", content, flags=re.I)
         content = re.sub(r"\s*```$", "", content)
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        start = content.find("[")
-        end = content.rfind("]")
-        if start >= 0 and end > start:
-            return json.loads(content[start : end + 1])
-        raise
+        content = content.strip()
+
+    # Some models add a short translation label despite being told not to.
+    content = re.sub(
+        r"^(?:翻译(?:结果|如下)?|译文|简体中文|中文译文)\s*[:：]\s*",
+        "",
+        content,
+        flags=re.I,
+    ).strip()
+
+    # If the model returned a JSON-style quoted string, decode just that string.
+    if len(content) >= 2 and content[0] == '"' and content[-1] == '"':
+        try:
+            decoded = json.loads(content)
+            if isinstance(decoded, str):
+                content = decoded
+        except json.JSONDecodeError:
+            pass
+
+    return content.strip()
 
 
-def translate_batch(base_url, model, items, target_language, timeout, retries, temperature, top_p, max_tokens):
-    system, user, token_tables = build_prompt(items, target_language)
+def call_translation_model(
+    base_url,
+    model,
+    text,
+    target_language,
+    timeout,
+    retries,
+    temperature,
+    top_p,
+    max_tokens,
+    placeholder_note=False,
+):
+    note = ""
+    if placeholder_note:
+        note = (
+            " 文本中的 __RET_0000__ 这类标记是不可修改的占位符，必须逐字原样保留，"
+            "不要删除、翻译、移动或改变下划线和数字。"
+        )
+
+    prompt = (
+        f"将以下英文文本翻译为{target_language}。"
+        "只输出译文，不要解释，不要添加引号。"
+        "保持人物语气、俚语、粗口、性暗示及虚构成人对白的原意，不要弱化措辞。"
+        + note
+        + "\n\n"
+        + text
+    )
+
+    # HY-MT is a translation model rather than a general instruction-following
+    # model. A single plain translation request is much more reliable than asking
+    # it to manufacture JSON arrays.
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
         "top_p": top_p,
         "max_tokens": max_tokens,
@@ -189,29 +224,141 @@ def translate_batch(base_url, model, items, target_language, timeout, retries, t
     last_error = None
     for attempt in range(1, retries + 1):
         try:
-            result = http_json("POST", f"{base_url}/chat/completions", payload, timeout=timeout)
+            result = http_json(
+                "POST", f"{base_url}/chat/completions", payload, timeout=timeout
+            )
             content = result["choices"][0]["message"]["content"]
-            parsed = parse_json_response(content)
-            if not isinstance(parsed, list) or len(parsed) != len(items):
-                raise ValueError(f"模型返回数量不匹配：期望 {len(items)}，实际 {len(parsed) if isinstance(parsed, list) else '非数组'}")
-            by_id = {str(x["id"]): x["text"] for x in parsed}
-            translated = []
-            for i in range(len(items)):
-                key = str(i)
-                if key not in by_id:
-                    raise ValueError(f"模型返回缺少 id={i}")
-                text = restore_tokens(str(by_id[key]), token_tables[key])
-                # Ensure every protected token survived exactly once at minimum.
-                for _, original in token_tables[key]:
-                    if original not in text:
-                        raise ValueError(f"占位符/文本标签丢失：{original}")
-                translated.append(text)
+            translated = clean_model_output(content)
+            if not translated:
+                raise ValueError("模型返回了空译文")
             return translated
         except Exception as e:
             last_error = e
             if attempt < retries:
                 time.sleep(min(2 ** (attempt - 1), 5))
+
     raise RuntimeError(f"翻译失败，重试 {retries} 次后仍出错：{last_error}")
+
+
+def translate_piece(
+    base_url,
+    model,
+    piece,
+    target_language,
+    timeout,
+    retries,
+    temperature,
+    top_p,
+    max_tokens,
+):
+    # Keep exact surrounding whitespace when translating fallback segments.
+    m = re.match(r"^(\s*)(.*?)(\s*)$", piece, flags=re.S)
+    leading, core, trailing = m.groups()
+    if not core or not LATIN_RE.search(core):
+        return piece
+
+    translated = call_translation_model(
+        base_url,
+        model,
+        core,
+        target_language,
+        timeout,
+        retries,
+        temperature,
+        top_p,
+        max_tokens,
+        placeholder_note=False,
+    )
+    return leading + translated + trailing
+
+
+def translate_by_segments(
+    base_url,
+    model,
+    text,
+    target_language,
+    timeout,
+    retries,
+    temperature,
+    top_p,
+    max_tokens,
+):
+    """
+    Guaranteed-safe fallback.
+
+    Protected tags/variables are never sent to the model. Only the text between
+    them is translated, then the original tokens are concatenated back verbatim.
+    This may be slightly less context-aware, but it cannot lose {i}, {/i}, [name],
+    printf placeholders, or escaped Ren'Py sequences.
+    """
+    parts = PROTECTED_TOKEN_RE.split(text)
+    out = []
+    for part in parts:
+        if not part:
+            continue
+        if PROTECTED_TOKEN_RE.fullmatch(part):
+            out.append(part)
+        else:
+            out.append(
+                translate_piece(
+                    base_url,
+                    model,
+                    part,
+                    target_language,
+                    timeout,
+                    retries,
+                    temperature,
+                    top_p,
+                    max_tokens,
+                )
+            )
+    return "".join(out)
+
+
+def translate_text(
+    base_url,
+    model,
+    text,
+    target_language,
+    timeout,
+    retries,
+    temperature,
+    top_p,
+    max_tokens,
+):
+    protected, table = make_placeholders(text)
+
+    translated = call_translation_model(
+        base_url,
+        model,
+        protected,
+        target_language,
+        timeout,
+        retries,
+        temperature,
+        top_p,
+        max_tokens,
+        placeholder_note=bool(table),
+    )
+
+    # Fast path: the model preserved every marker exactly once.
+    if table and not all(translated.count(marker) == 1 for marker, _ in table):
+        return translate_by_segments(
+            base_url,
+            model,
+            text,
+            target_language,
+            timeout,
+            retries,
+            temperature,
+            top_p,
+            max_tokens,
+        )
+
+    for marker, original in table:
+        translated = translated.replace(marker, original)
+
+    return translated
 
 
 def find_rpy_files(path):
@@ -219,10 +366,13 @@ def find_rpy_files(path):
 
 
 def load_finished(path):
-    finished = set()
-    if path.exists():
-        finished = {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
-    return finished
+    if not path.exists():
+        return set()
+    return {
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
 
 
 def append_finished(path, file_path):
@@ -248,13 +398,18 @@ def process_file(file_path, args, model, finished_path, finished):
     if args.backup and not backup_path.exists():
         backup_path.write_text(original, encoding="utf-8")
 
-    for start in tqdm(range(0, len(entries), args.batch), desc=file_path.name, unit="batch"):
+    # --batch now controls checkpoint granularity only. Each dialogue line is sent
+    # as its own translation request because HY-MT is substantially more reliable
+    # this way than with a JSON batch protocol.
+    groups = range(0, len(entries), args.batch)
+    for start in tqdm(groups, desc=file_path.name, unit="batch"):
         batch = entries[start : start + args.batch]
-        try:
-            results = translate_batch(
+
+        for entry in batch:
+            translated = translate_text(
                 args.base_url,
                 model,
-                batch,
+                entry["text"],
                 args.target_language,
                 args.timeout,
                 args.retries,
@@ -262,57 +417,66 @@ def process_file(file_path, args, model, finished_path, finished):
                 args.top_p,
                 args.max_tokens,
             )
-        except Exception:
-            # If a multi-entry batch fails validation, retry one by one. This is slower
-            # but prevents one malformed response from corrupting an entire rpy file.
-            if len(batch) == 1:
-                raise
-            results = []
-            for entry in batch:
-                results.extend(
-                    translate_batch(
-                        args.base_url,
-                        model,
-                        [entry],
-                        args.target_language,
-                        args.timeout,
-                        args.retries,
-                        args.temperature,
-                        args.top_p,
-                        args.max_tokens,
-                    )
-                )
-
-        for entry, translated in zip(batch, results):
             escaped = encode_renpy_string(translated)
-            lines[entry["line"]] = f'{entry["prefix"]}"{escaped}"{entry["suffix"]}'
+            lines[entry["line"]] = (
+                f'{entry["prefix"]}"{escaped}"{entry["suffix"]}'
+            )
 
-        # Incremental save: a crash or Ctrl+C will not lose completed batches.
-        file_path.write_text("\n".join(lines) + ("\n" if original.endswith("\n") else ""), encoding="utf-8")
+        # Incremental checkpoint so Ctrl+C or a model error does not lose progress.
+        file_path.write_text(
+            "\n".join(lines) + ("\n" if original.endswith("\n") else ""),
+            encoding="utf-8",
+        )
 
     append_finished(finished_path, file_path)
     print(f"处理完成：{file_path}")
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Ren'Py rpy 本地 AI 一键翻译（LM Studio / OpenAI Compatible API）")
-    p.add_argument("path", help="Ren'Py 生成的翻译目录，例如 game/tl/schinese")
-    p.add_argument("--base-url", default=os.getenv("LMSTUDIO_BASE_URL", DEFAULT_BASE_URL), help="LM Studio API，默认 http://127.0.0.1:1234/v1")
-    p.add_argument("--model", default=os.getenv("LMSTUDIO_MODEL", DEFAULT_MODEL), help="模型 id；默认 auto 自动取 /v1/models 第一个模型")
+    p = argparse.ArgumentParser(
+        description="Ren'Py rpy 本地 AI 一键翻译（LM Studio / OpenAI Compatible API）"
+    )
+    p.add_argument(
+        "path", help="Ren'Py 生成的翻译目录，例如 game/tl/schinese"
+    )
+    p.add_argument(
+        "--base-url",
+        default=os.getenv("LMSTUDIO_BASE_URL", DEFAULT_BASE_URL),
+        help="LM Studio API，默认 http://127.0.0.1:1234/v1",
+    )
+    p.add_argument(
+        "--model",
+        default=os.getenv("LMSTUDIO_MODEL", DEFAULT_MODEL),
+        help="模型 id；默认 auto 自动取 /v1/models 第一个模型",
+    )
     p.add_argument("--target-language", default=DEFAULT_LANGUAGE)
-    p.add_argument("--batch", type=int, default=DEFAULT_CHUNK_BLOCKS, help="每次请求翻译多少条文本，默认 4")
+    p.add_argument(
+        "--batch",
+        type=int,
+        default=DEFAULT_CHUNK_BLOCKS,
+        help="每多少条翻译写回一次文件，默认 4；每条文本仍独立请求模型",
+    )
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     p.add_argument("--top-p", type=float, default=DEFAULT_TOP_P)
     p.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
-    p.add_argument("--no-backup", dest="backup", action="store_false", help="不创建 .rpy.bak 备份")
+    p.add_argument(
+        "--no-backup",
+        dest="backup",
+        action="store_false",
+        help="不创建 .rpy.bak 备份",
+    )
     p.set_defaults(backup=True)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.batch < 1:
+        print("--batch 必须 >= 1", file=sys.stderr)
+        return 2
+
     args.base_url = normalize_base_url(args.base_url)
     root = Path(args.path)
     if not root.exists():
@@ -338,7 +502,9 @@ def main():
             print("\n用户中止。已完成的批次已写回文件。")
             return 130
         except Exception as e:
-            with Path("error_file_list_lmstudio.txt").open("a", encoding="utf-8") as f:
+            with Path("error_file_list_lmstudio.txt").open(
+                "a", encoding="utf-8"
+            ) as f:
                 f.write(f"{file_path.resolve()}\t{e}\n")
             print(f"处理失败：{file_path}\n{e}", file=sys.stderr)
 
