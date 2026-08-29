@@ -43,10 +43,10 @@ lmstudio.py
 * 增量写入，程序中断后已完成批次不会全部丢失
 * 默认跳过已经含中文的译文，重复运行不会把已经翻好的中文再次改写
 * 支持 `--retranslate`，需要时可从 Ren'Py 注释/`old` 行恢复英文原文并重翻已有中文
-* 自动保护 Ren'Py 文本标签、变量和常见占位符，例如 `{i}`、`{/i}`、`[player_name]`、`%(name)s`
-* 默认多句批量翻译，同一批文本天然互为上下文，减少 API 往返并提高速度
-* 可额外携带前面若干条英中对照作为上下文
-* 批量协议或标签保护失败时自动降级为安全的单句翻译，不会因为一条异常污染整个文件
+* 针对 HY-MT 优化：普通连续对白不再要求模型输出 JSON 或特殊 RET 标记，而是直接做“多行输入 → 多行输出”
+* Ren'Py 标签、变量和转义符所在的行自动走安全模式；`{i}`、`{/i}`、`[player_name]`、`%(name)s` 等标签不会发送给模型
+* 批量输出格式异常时不会整批退化成单句，而是自动二分：例如 `16 → 8+8 → 4+4`，只让真正有问题的小块继续降级
+* 当前批次中的连续对白天然互为上下文；额外历史上下文默认关闭以获得更高速度
 * Prompt 针对 Visual Novel / Ren'Py 对话进行了优化，保留人物语气、粗口、性暗示及虚构成人对白原意
 
 #### LM Studio 设置
@@ -81,7 +81,7 @@ pip install tqdm
 D:\Games\WaifuAcademy\game\tl\schinese
 ```
 
-运行：
+直接运行：
 
 ```bash
 python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese"
@@ -89,39 +89,74 @@ python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese"
 
 脚本会自动连接 `http://127.0.0.1:1234/v1`，并自动使用 LM Studio 当前加载的第一个模型。
 
-#### 推荐参数
+#### HY-MT 高速模式
 
 当前默认：
 
 ```text
-batch = 8
-context = 4
+batch = 16
+context = 0
+max_batch_chars = 6000
 temperature = 0.7
 top_p = 0.6
 max_tokens = 2048
 ```
 
-这里的 `batch=8` 表示尽量一次 API 请求翻译 8 条连续文本；这些文本会彼此作为上下文。如果模型没有按协议返回，会自动降级为单句，因此无需为了稳定性长期固定在 `batch=1`。
+`batch=16` 表示一次请求最多翻译 16 行连续的普通对白/旁白。当前批次里的文本本身就是连续剧情，所以即使 `context=0`，模型仍能看到同批上下文。
 
-Waifu Academy / 7B 本地模型可先尝试：
-
-```bash
-python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 8 --context 4
-```
-
-如果显卡和模型速度足够，进一步提速可以尝试：
+推荐先直接使用默认参数：
 
 ```bash
-python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 12 --context 6
+python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese"
 ```
 
-如果批量经常自动降级，则改小：
+如果运行稳定并希望进一步提速，可以尝试：
 
 ```bash
-python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 4 --context 4
+python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 24 --context 0
 ```
 
-`--context 0` 可以关闭额外的历史英中对照；当前批次中的多条文本仍然互相提供语境。
+或：
+
+```bash
+python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 32 --context 0
+```
+
+如果模型开始频繁出现“批量译文行数不匹配”，改回：
+
+```bash
+--batch 16
+```
+
+新版会自动递归二分失败批次。例如 16 行返回格式不稳定时，会先尝试 8+8，而不是像旧版那样立即发送 16 次单句请求。
+
+如果更看重跨批次人物语气一致性，可少量增加历史上下文：
+
+```bash
+python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 16 --context 2
+```
+
+不建议为了实时批量汉化把 `context` 开得很大；上下文越多，每次请求重复计算的 Prompt 越长，速度越慢。
+
+#### Ren'Py 标签安全模式
+
+普通无标签文本会进入高速批量模式。
+
+如果某一行包含：
+
+```text
+{i}
+{/i}
+{b}
+{/b}
+[player_name]
+%(name)s
+\n
+```
+
+这行会自动退出高速批量，程序先把标签从文本中拆出来，只把普通英文片段交给模型，翻译完成后再把原标签拼回原位置。
+
+因此不会再依赖 HY-MT 自己“记住并原样输出” `{i}` 等标签。
 
 #### 已经翻译过的内容
 
@@ -134,7 +169,7 @@ python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 4 --context 
 如果你更换模型或 Prompt，希望重新润色已经翻好的中文，可以使用：
 
 ```bash
-python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --retranslate --batch 8 --context 6
+python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --retranslate --batch 16 --context 2
 ```
 
 `--retranslate` 会尽量从 Ren'Py 自动保留的英文注释行或 `old` 行恢复原文，再重新生成中文。找不到可靠英文原文的行不会强行改写。
