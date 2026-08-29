@@ -43,23 +43,34 @@ def deal_file(raw_file_path):
     results = []
     last_result = ""
 
+    # 从环境变量读取名字，生成 URL
+    myName = os.environ.get('myName')
+    url = f"https://www.deepl.com/zh/translator#en/zh/{myName}"
+
+    # 将 js 代码存储为字符串
+
+    with open('index.js', 'r', encoding='utf-8') as file:
+        index_content = file.read()
+
     for chunk in tqdm(chunks):
-        js_script = f"""
+        js_script = """
                 var inputBox = document.querySelector('div[contenteditable="true"][role="textbox"]');
                 var outputBox = document.querySelector('d-textarea[name="target"] div[contenteditable="true"]');
-                var textToCopy = `{chunk}`;
+
+                // 通过 Selenium 传进来的第一个参数作为文本，避免模板字符串执行出错
+                var textToCopy = arguments[0];
 
                 // 设置输入框的内容
                 inputBox.innerHTML = textToCopy;
 
                 // 创建并触发input事件以确保网站检测到变化
-                var event = new Event('input', {{ bubbles: true }});
+                var event = new Event('input', { bubbles: true });
                 inputBox.dispatchEvent(event);
 
-                // setTimeout(function() {{
-                // var result = outputBox.innerHTML;
-                // console.log("输出结果: " + result);
-                // }}, 60000);
+                // setTimeout(function() {
+                //     var result = outputBox.innerHTML;
+                //     console.log("输出结果: " + result);
+                // }, 60000);
                 """
         global browser
         browser.get(url)
@@ -70,13 +81,13 @@ def deal_file(raw_file_path):
             browser.refresh()
         try:
             browser.execute_script(index_content)
-            browser.execute_script(js_script)
+            browser.execute_script(js_script, chunk)
         except:
             browser = webdriver.Chrome(options=options)
             browser.get(url)
             browser.refresh()
             browser.execute_script(index_content)
-            browser.execute_script(js_script)
+            browser.execute_script(js_script, chunk)
 
         output_box = None
         result = ""
@@ -93,12 +104,11 @@ def deal_file(raw_file_path):
                     result = chunk
                     error_cnt +=1
                     break
-        if error_cnt > max(len(chunks) // 20, 4):
-            with open("./error_file_list.txt", 'a', encoding="utf-8") as errf:
-                print(raw_file_path + "处理失败，可能已经被限速，请稍后重试")
-                errf.write(f"{raw_file_path}\n")
-                return
+
+        print(result)
         last_result = result
+
+        # 在每个块之间增加一个换行符以将其连接起来
         results.append(result)
         cnt +=1
 
@@ -131,13 +141,17 @@ def find_rpy_files(path):
     return rpy_files
 
 if __name__ == "__main__":
-    path = "C:XXXXXXXXXXXX/aa"	# 替换为要翻译的文件所在的路径
-    url = 'https://www.deepl.com/zh/translator#en/zh/'	# 默认英翻中，想翻别的语言可以把这里改一下
-    with open('index.js', 'r', encoding='utf-8') as file:
-        index_content = file.read()
-
+    path = "W:\\Downloads\\ABDM\\Compressed\\Tropicali-1.0.0-pc\\game"  # 替换为要翻译的文件所在的路径
     options = Options()
-    options.add_argument("headless")
+    options.add_argument("--start-maximized")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    prefs = {
+        'translate_whitelists': {'en': 'zh-CN'},
+        'translate': {'enabled': True}
+    }
+    options.add_experimental_option('prefs', prefs)
+
     # options.add_argument("--lang=zh-CN")
     finished = False
     while not finished:
