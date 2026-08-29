@@ -41,12 +41,12 @@ lmstudio.py
 * 自动读取 `/v1/models` 获取当前已加载模型
 * 默认备份原 `.rpy` 为 `.rpy.bak`
 * 增量写入，程序中断后已完成批次不会全部丢失
-* 自动保护 Ren'Py 文本标签、变量和常见占位符，例如：
-  * `{i}` / `{/i}`
-  * `{b}` / `{/b}`
-  * `[player_name]`
-  * `%(name)s`
-* 批量翻译失败时自动降级为逐条翻译，避免整个文件被错误返回污染
+* 默认跳过已经含中文的译文，重复运行不会把已经翻好的中文再次改写
+* 支持 `--retranslate`，需要时可从 Ren'Py 注释/`old` 行恢复英文原文并重翻已有中文
+* 自动保护 Ren'Py 文本标签、变量和常见占位符，例如 `{i}`、`{/i}`、`[player_name]`、`%(name)s`
+* 默认多句批量翻译，同一批文本天然互为上下文，减少 API 往返并提高速度
+* 可额外携带前面若干条英中对照作为上下文
+* 批量协议或标签保护失败时自动降级为安全的单句翻译，不会因为一条异常污染整个文件
 * Prompt 针对 Visual Novel / Ren'Py 对话进行了优化，保留人物语气、粗口、性暗示及虚构成人对白原意
 
 #### LM Studio 设置
@@ -87,50 +87,73 @@ D:\Games\WaifuAcademy\game\tl\schinese
 python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese"
 ```
 
-脚本会自动连接：
-
-```text
-http://127.0.0.1:1234/v1
-```
-
-并自动使用 LM Studio 当前加载的第一个模型。
-
-也可以手动指定模型：
-
-```bash
-python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --model "你的模型ID"
-```
-
-或者指定其他 OpenAI 兼容 API：
-
-```bash
-python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --base-url http://127.0.0.1:1234/v1
-```
+脚本会自动连接 `http://127.0.0.1:1234/v1`，并自动使用 LM Studio 当前加载的第一个模型。
 
 #### 推荐参数
 
-对于 7B 翻译模型，可先用默认参数：
+当前默认：
 
 ```text
-batch = 4
+batch = 8
+context = 4
 temperature = 0.7
 top_p = 0.6
 max_tokens = 2048
 ```
 
-若模型 JSON 输出不稳定，可降低批量：
+这里的 `batch=8` 表示尽量一次 API 请求翻译 8 条连续文本；这些文本会彼此作为上下文。如果模型没有按协议返回，会自动降级为单句，因此无需为了稳定性长期固定在 `batch=1`。
+
+Waifu Academy / 7B 本地模型可先尝试：
 
 ```bash
-python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 1
+python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 8 --context 4
 ```
 
-若想加快翻译，可尝试：
+如果显卡和模型速度足够，进一步提速可以尝试：
 
 ```bash
-python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 8
+python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 12 --context 6
 ```
 
-完整参数：
+如果批量经常自动降级，则改小：
+
+```bash
+python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --batch 4 --context 4
+```
+
+`--context 0` 可以关闭额外的历史英中对照；当前批次中的多条文本仍然互相提供语境。
+
+#### 已经翻译过的内容
+
+默认模式是 **增量翻译**：
+
+* 已经含中文的目标行保持不变；
+* 中途停止后直接重新运行即可；
+* 已经完整完成并记录在 `finished_file_list_lmstudio.txt` 的文件会被整体跳过。
+
+如果你更换模型或 Prompt，希望重新润色已经翻好的中文，可以使用：
+
+```bash
+python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --retranslate --batch 8 --context 6
+```
+
+`--retranslate` 会尽量从 Ren'Py 自动保留的英文注释行或 `old` 行恢复原文，再重新生成中文。找不到可靠英文原文的行不会强行改写。
+
+#### 其他参数
+
+手动指定模型：
+
+```bash
+python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --model "你的模型ID"
+```
+
+指定其他 OpenAI 兼容 API：
+
+```bash
+python lmstudio.py "D:\Games\WaifuAcademy\game\tl\schinese" --base-url http://127.0.0.1:1234/v1
+```
+
+查看完整参数：
 
 ```bash
 python lmstudio.py -h
@@ -150,11 +173,7 @@ finished_file_list_lmstudio.txt
 error_file_list_lmstudio.txt
 ```
 
-如果想重新翻译某个文件，可以：
-
-1. 恢复对应 `.rpy.bak`；
-2. 从 `finished_file_list_lmstudio.txt` 删除该文件路径；
-3. 再运行脚本。
+`.rpy.bak` 是首次处理该文件时保存的原始备份。
 
 ### 2B、原版 DeepL 网页翻译
 
@@ -166,11 +185,7 @@ error_file_list_lmstudio.txt
 
 * 无论使用 DeepL 还是本地 AI，完成后都建议在 Ren'Py Launcher 中运行 **检查脚本 / Check Script**。
 * `postprocess.py` 可继续用于修复部分 Ren'Py 标签问题。
-* 建议人工抽查：
-  * 人名一致性
-  * `[变量]` 是否保留
-  * `{i}`、`{b}` 等标签是否成对
-  * 菜单选项和 UI 文本是否被正确翻译
+* 建议人工抽查人名一致性、变量、文本标签、菜单选项和 UI 文本。
 
 ## 关于接口
 
