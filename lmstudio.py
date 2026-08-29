@@ -14,16 +14,23 @@ from tqdm import tqdm
 DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_LANGUAGE = "Simplified Chinese"
 DEFAULT_MODEL = "auto"
-DEFAULT_BATCH = 8
-DEFAULT_CONTEXT = 4
+
+# HY-MT is much faster when several plain dialogue lines are translated in one request.
+# 16 is intentionally conservative; 24/32 can be faster on a stable local setup.
+DEFAULT_BATCH = 16
+DEFAULT_CONTEXT = 0
+DEFAULT_MAX_BATCH_CHARS = 6000
+
 DEFAULT_TIMEOUT = 120
-DEFAULT_RETRIES = 3
+DEFAULT_RETRIES = 2
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 0.6
 DEFAULT_MAX_TOKENS = 2048
 
 # Ren'Py text tags/interpolation, escaped sequences and printf-style placeholders.
-# These tokens must never be translated or modified.
+# Lines containing these tokens are NOT sent through the multiline fast path. Instead
+# the code splits around the tokens, translates only ordinary text, and rejoins them.
+# This means the model never has to reproduce {i}, {/i}, [player_name], %(name)s, etc.
 PROTECTED_TOKEN_RE = re.compile(
     r"(\{/?[A-Za-z][^{}]*\}|\[[^\[\]\n]+\]|%(?:\([^)]+\))?[#0\- +]?(?:\d+|\*)?(?:\.\d+|\.\*)?[diouxXeEfFgGcrs%]|\\[nrt\"\\])"
 )
@@ -45,7 +52,7 @@ COMMENTED_QUOTED_RE = re.compile(
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 LATIN_RE = re.compile(r"[A-Za-z]")
-BATCH_MARKER_RE = re.compile(r"(?m)^<<<RET_(\d{4})>>>\s*")
+NUMBER_PREFIX_RE = re.compile(r"^\s*(?:\d+[\.\)、:：]\s*|[-*]\s+)")
 
 
 def http_json(method, url, payload=None, timeout=DEFAULT_TIMEOUT):
@@ -126,6 +133,7 @@ def recover_original_source(lines, idx, current_prefix):
 
 def collect_entries(lines, retranslate=False):
     entries = []
+
     for idx, line in enumerate(lines):
         if line.lstrip().startswith("#"):
             continue
@@ -147,7 +155,7 @@ def collect_entries(lines, retranslate=False):
         if prefix_name == "new":
             original = recover_original_source(lines, idx, m.group("prefix"))
             if original is not None:
-                # If 'new' has already been changed, preserve it unless explicitly
+                # If 'new' has already been changed, preserve it unless explicit
                 # retranslation was requested.
                 if current_text != original and not retranslate:
                     continue
@@ -155,11 +163,10 @@ def collect_entries(lines, retranslate=False):
 
         if CJK_RE.search(current_text):
             if not retranslate:
-                # Default resume behaviour: existing Chinese is never touched.
+                # Resume-safe default: existing Chinese is never changed.
                 continue
             original = recover_original_source(lines, idx, m.group("prefix"))
             if original is None or not LATIN_RE.search(original):
-                # We cannot safely retranslate without the original English source.
                 continue
             source_text = original
 
@@ -177,18 +184,6 @@ def collect_entries(lines, retranslate=False):
         )
 
     return entries
-
-
-def make_placeholders(text, item_index=0):
-    """Replace protected Ren'Py tokens with item-specific ASCII placeholders."""
-    table = []
-
-    def repl(match):
-        marker = f"__RET_TAG_{item_index:02d}_{len(table):03d}__"
-        table.append((marker, match.group(0)))
-        return marker
-
-    return PROTECTED_TOKEN_RE.sub(repl, text), table
 
 
 def clean_model_output(content):
@@ -217,30 +212,24 @@ def clean_model_output(content):
     return content.strip()
 
 
-def api_chat(
-    base_url,
-    model,
-    prompt,
-    timeout,
-    retries,
-    temperature,
-    top_p,
-    max_tokens,
-):
+def api_chat(base_url, model, prompt, args):
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
-        "top_p": top_p,
-        "max_tokens": max_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "max_tokens": args.max_tokens,
         "stream": False,
     }
 
     last_error = None
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, args.retries + 1):
         try:
             result = http_json(
-                "POST", f"{base_url}/chat/completions", payload, timeout=timeout
+                "POST",
+                f"{base_url}/chat/completions",
+                payload,
+                timeout=args.timeout,
             )
             content = result["choices"][0]["message"]["content"]
             cleaned = clean_model_output(content)
@@ -249,189 +238,200 @@ def api_chat(
             return cleaned
         except Exception as e:
             last_error = e
-            if attempt < retries:
-                time.sleep(min(2 ** (attempt - 1), 5))
+            if attempt < args.retries:
+                time.sleep(min(2 ** (attempt - 1), 3))
 
-    raise RuntimeError(f"翻译失败，重试 {retries} 次后仍出错：{last_error}")
+    raise RuntimeError(f"翻译失败，重试 {args.retries} 次后仍出错：{last_error}")
 
 
-def translate_piece(base_url, model, piece, args):
-    m = re.match(r"^(\s*)(.*?)(\s*)$", piece, flags=re.S)
-    leading, core, trailing = m.groups()
-    if not core or not LATIN_RE.search(core):
-        return piece
+def context_prompt(context, args):
+    if not context or args.context <= 0:
+        return ""
 
+    rows = context[-args.context :]
+    text = "以下是前文参考，仅用于理解人物关系和语气，不要输出或重新翻译前文：\n"
+    for src, dst in rows:
+        text += f"EN: {src}\nZH: {dst}\n"
+    return text + "\n"
+
+
+def translate_plain_single(base_url, model, text, args, context=None):
     prompt = (
-        f"将以下英文视觉小说文本翻译为{args.target_language}。"
+        context_prompt(context, args)
+        + f"将以下英文视觉小说文本翻译为{args.target_language}。"
         "只输出译文，不要解释，不要添加引号。"
-        "保持人物语气、俚语、粗口、性暗示及虚构成人对白的原意，不要弱化措辞。\n\n"
-        + core
+        "保持人物语气、俚语、粗口、性暗示及虚构成人对白原意，不要弱化措辞。\n\n"
+        + text
     )
-    translated = api_chat(
-        base_url,
-        model,
-        prompt,
-        args.timeout,
-        args.retries,
-        args.temperature,
-        args.top_p,
-        args.max_tokens,
-    )
-    return leading + translated + trailing
+    return api_chat(base_url, model, prompt, args)
 
 
-def translate_by_segments(base_url, model, text, args):
-    """Guaranteed-safe fallback: protected tokens are never sent to the model."""
+def translate_protected(base_url, model, text, args, context=None):
+    """
+    Safe path for lines containing Ren'Py tags/variables.
+
+    Protected tokens are never sent to the model. Ordinary text segments around them
+    are translated independently and then joined with the original tokens. This is a
+    little slower for tagged lines, but it eliminates the old {i}/{/i} loss problem.
+    """
     parts = PROTECTED_TOKEN_RE.split(text)
     out = []
+
     for part in parts:
         if not part:
             continue
         if PROTECTED_TOKEN_RE.fullmatch(part):
             out.append(part)
-        else:
-            out.append(translate_piece(base_url, model, part, args))
+            continue
+
+        m = re.match(r"^(\s*)(.*?)(\s*)$", part, flags=re.S)
+        leading, core, trailing = m.groups()
+        if not core or not LATIN_RE.search(core):
+            out.append(part)
+            continue
+
+        translated = translate_plain_single(base_url, model, core, args, context)
+        out.append(leading + translated + trailing)
+
     return "".join(out)
 
 
-def translate_single(base_url, model, text, args, context=None):
-    protected, table = make_placeholders(text, 0)
-
-    context_text = ""
-    if context:
-        context_text = "\n以下是前文，仅用于理解人物关系和语气，不要翻译或输出前文：\n"
-        for src, dst in context[-args.context :]:
-            context_text += f"EN: {src}\nZH: {dst}\n"
-
-    placeholder_note = ""
-    if table:
-        placeholder_note = (
-            " 文本中的 __RET_TAG_00_000__ 这类标记必须逐字原样保留，"
-            "不要删除、翻译、移动或改变。"
-        )
-
-    prompt = (
-        f"将以下英文视觉小说文本翻译为{args.target_language}。"
-        "只输出当前文本的译文，不要解释，不要添加引号。"
-        "保持人物语气、俚语、粗口、性暗示及虚构成人对白的原意，不要弱化措辞。"
-        + placeholder_note
-        + context_text
-        + "\n当前文本：\n"
-        + protected
-    )
-
-    translated = api_chat(
-        base_url,
-        model,
-        prompt,
-        args.timeout,
-        args.retries,
-        args.temperature,
-        args.top_p,
-        args.max_tokens,
-    )
-
-    if table and not all(translated.count(marker) == 1 for marker, _ in table):
-        return translate_by_segments(base_url, model, text, args)
-
-    for marker, original in table:
-        translated = translated.replace(marker, original)
-
-    return translated
-
-
-def build_batch_prompt(items, args, context):
-    protected_items = []
-    tables = []
-
-    for i, item in enumerate(items):
-        protected, table = make_placeholders(item["text"], i)
-        protected_items.append(protected)
-        tables.append(table)
-
-    context_text = ""
-    if context and args.context > 0:
-        context_text = (
-            "\n【前文参考】下面内容只用于理解上下文，不要输出这些内容：\n"
-        )
-        for src, dst in context[-args.context :]:
-            context_text += f"EN: {src}\nZH: {dst}\n"
-
-    current = []
-    for i, text in enumerate(protected_items):
-        current.append(f"<<<RET_{i:04d}>>>\n{text}")
-
-    prompt = (
-        f"把下面多条英文视觉小说文本翻译为{args.target_language}。"
-        "这些文本按剧情顺序排列，可以互相作为上下文。"
-        "保持人物语气、俚语、粗口、性暗示及虚构成人对白原意，不要弱化措辞。"
-        "所有 __RET_TAG_XX_XXX__ 都是 Ren'Py 标签占位符，必须逐字原样保留。"
-        "\n输出规则非常重要："
-        "每条译文前必须原样输出对应的 <<<RET_0000>>> 标记；"
-        "不要输出英文原文、解释、JSON、代码块或其他内容；"
-        "不得合并、删除或重新排序条目。"
-        + context_text
-        + "\n【当前待翻译文本】\n"
-        + "\n".join(current)
-    )
-
-    return prompt, tables
-
-
-def parse_batch_response(content, count):
-    content = clean_model_output(content)
-    matches = list(BATCH_MARKER_RE.finditer(content))
-    if len(matches) != count:
-        raise ValueError(f"批量标记数量不匹配：期望 {count}，实际 {len(matches)}")
-
-    result = {}
-    for pos, match in enumerate(matches):
-        idx = int(match.group(1))
-        if idx < 0 or idx >= count or idx in result:
-            raise ValueError(f"批量标记异常：RET_{idx:04d}")
-        start = match.end()
-        end = matches[pos + 1].start() if pos + 1 < len(matches) else len(content)
-        result[idx] = content[start:end].strip()
-
-    if set(result) != set(range(count)):
-        raise ValueError("批量返回缺少或重复条目")
-    if any(not result[i] for i in range(count)):
-        raise ValueError("批量返回存在空译文")
-
-    return [result[i] for i in range(count)]
-
-
-def translate_batch(base_url, model, items, args, context):
+def normalize_multiline_output(content, expected_count):
     """
-    Fast path: translate several consecutive VN lines in one API request.
-    Any protocol/tag failure raises and the caller falls back to safe single-line mode.
+    HY-MT generally preserves line breaks much better than synthetic markers/JSON.
+    Accept exactly one translated line per source line. A small numbered-prefix
+    cleanup is allowed because some chat templates may add 1./2. despite prompting.
+    """
+    content = clean_model_output(content)
+    lines = content.splitlines()
+
+    # Remove only leading/trailing blank lines, never blanks in the middle.
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    if len(lines) != expected_count:
+        raise ValueError(
+            f"批量译文行数不匹配：期望 {expected_count}，实际 {len(lines)}"
+        )
+
+    cleaned = []
+    for line in lines:
+        line = NUMBER_PREFIX_RE.sub("", line).strip()
+        if not line:
+            raise ValueError("批量译文存在空行")
+        cleaned.append(line)
+
+    return cleaned
+
+
+def translate_plain_batch_once(base_url, model, items, args, context=None):
+    """
+    Fast HY-MT path.
+
+    No JSON, no RET markers and no Ren'Py tags are included. We simply send N plain
+    dialogue lines and require N translated lines back. Consecutive lines naturally
+    provide each other with local VN context.
     """
     if len(items) == 1:
-        return [translate_single(base_url, model, items[0]["text"], args, context)]
+        return [
+            translate_plain_single(
+                base_url, model, items[0]["text"], args, context
+            )
+        ]
 
-    prompt, tables = build_batch_prompt(items, args, context)
-    content = api_chat(
-        base_url,
-        model,
-        prompt,
-        args.timeout,
-        args.retries,
-        args.temperature,
-        args.top_p,
-        args.max_tokens,
+    source_lines = [item["text"].replace("\r", " ").replace("\n", " ") for item in items]
+    prompt = (
+        context_prompt(context, args)
+        + f"将下面 {len(items)} 行英文视觉小说对白/旁白逐行翻译为{args.target_language}。"
+        f"输出必须恰好 {len(items)} 行，一行对应一行，顺序完全一致。"
+        "不要编号，不要解释，不要输出英文原文，不要合并或拆分行。"
+        "保持人物语气、俚语、粗口、性暗示及虚构成人对白原意，不要弱化措辞。\n\n"
+        + "\n".join(source_lines)
     )
-    outputs = parse_batch_response(content, len(items))
 
-    restored = []
-    for i, translated in enumerate(outputs):
-        table = tables[i]
-        if table and not all(translated.count(marker) == 1 for marker, _ in table):
-            raise ValueError(f"第 {i + 1} 条的 Ren'Py 标签占位符未完整保留")
-        for marker, original in table:
-            translated = translated.replace(marker, original)
-        restored.append(translated)
+    content = api_chat(base_url, model, prompt, args)
+    return normalize_multiline_output(content, len(items))
 
-    return restored
+
+def translate_plain_batch_recursive(base_url, model, items, args, context=None, depth=0):
+    """
+    Translate a plain-text batch. On a formatting failure, split the batch in half
+    instead of immediately falling back to N single requests.
+
+    Example: 16 -> 8+8 -> only the troublesome half may become 4+4/2+2/1.
+    This is substantially faster than the previous all-or-nothing fallback.
+    """
+    try:
+        return translate_plain_batch_once(base_url, model, items, args, context)
+    except Exception as e:
+        if len(items) == 1:
+            raise
+
+        mid = len(items) // 2
+        if depth == 0:
+            tqdm.write(
+                f"批量格式不稳定，自动二分重试：{len(items)} -> "
+                f"{mid}+{len(items) - mid}（{e}）"
+            )
+
+        left = translate_plain_batch_recursive(
+            base_url, model, items[:mid], args, context, depth + 1
+        )
+
+        # Let the successfully translated left half become context for the right half.
+        right_context = list(context or [])
+        for item, translated in zip(items[:mid], left):
+            right_context.append((item["text"], translated))
+
+        right = translate_plain_batch_recursive(
+            base_url, model, items[mid:], args, right_context, depth + 1
+        )
+        return left + right
+
+
+def is_fast_safe(text):
+    # Any protected token or real newline goes through the safe path.
+    return not PROTECTED_TOKEN_RE.search(text) and "\n" not in text and "\r" not in text
+
+
+def make_groups(entries, batch_size, max_chars):
+    """
+    Build groups for the fast path. Tagged lines are isolated as single safe groups.
+    Plain consecutive lines are packed up to batch_size / max_chars.
+    """
+    groups = []
+    pending = []
+    pending_chars = 0
+
+    def flush():
+        nonlocal pending, pending_chars
+        if pending:
+            groups.append(("plain", pending))
+            pending = []
+            pending_chars = 0
+
+    for entry in entries:
+        text = entry["text"]
+
+        if not is_fast_safe(text):
+            flush()
+            groups.append(("protected", [entry]))
+            continue
+
+        item_chars = len(text)
+        if pending and (
+            len(pending) >= batch_size
+            or pending_chars + item_chars > max_chars
+        ):
+            flush()
+
+        pending.append(entry)
+        pending_chars += item_chars
+
+    flush()
+    return groups
 
 
 def find_rpy_files(path):
@@ -462,6 +462,7 @@ def process_file(file_path, args, model, finished_path, finished):
     original = file_path.read_text(encoding="utf-8")
     lines = original.splitlines(keepends=False)
     entries = collect_entries(lines, retranslate=args.retranslate)
+
     if not entries:
         print(f"无待翻译文本，跳过：{file_path}")
         if not args.retranslate and resolved not in finished:
@@ -472,39 +473,44 @@ def process_file(file_path, args, model, finished_path, finished):
     if args.backup and not backup_path.exists():
         backup_path.write_text(original, encoding="utf-8")
 
+    groups = make_groups(entries, args.batch, args.max_batch_chars)
     history = []
-    groups = range(0, len(entries), args.batch)
-    for start in tqdm(groups, desc=file_path.name, unit="batch"):
-        batch = entries[start : start + args.batch]
 
-        try:
-            results = translate_batch(args.base_url, model, batch, args, history)
-        except Exception as batch_error:
-            # HY-MT may occasionally ignore the multi-entry output protocol. Do not
-            # fail the file: transparently retry this batch one line at a time.
-            tqdm.write(f"批量翻译降级为单句：{batch_error}")
-            results = []
-            for entry in batch:
-                translated = translate_single(
-                    args.base_url, model, entry["text"], args, history
+    for kind, group in tqdm(groups, desc=file_path.name, unit="batch"):
+        if kind == "protected":
+            entry = group[0]
+            results = [
+                translate_protected(
+                    args.base_url,
+                    model,
+                    entry["text"],
+                    args,
+                    history,
                 )
-                results.append(translated)
-                history.append((entry["text"], translated))
+            ]
         else:
-            for entry, translated in zip(batch, results):
-                history.append((entry["text"], translated))
+            results = translate_plain_batch_recursive(
+                args.base_url,
+                model,
+                group,
+                args,
+                history,
+            )
 
-        # Keep only the amount of history we actually need.
-        if args.context >= 0 and len(history) > max(args.context, 1) * 2:
-            history = history[-max(args.context, 1) * 2 :]
-
-        for entry, translated in zip(batch, results):
+        for entry, translated in zip(group, results):
             escaped = encode_renpy_string(translated)
             lines[entry["line"]] = (
                 f'{entry["prefix"]}"{escaped}"{entry["suffix"]}'
             )
+            history.append((entry["text"], translated))
 
-        # Incremental checkpoint so Ctrl+C or a model error does not lose progress.
+        # Keep context small. A batch already supplies local context for all its lines.
+        if args.context > 0:
+            history = history[-max(args.context * 2, args.context):]
+        else:
+            history = []
+
+        # Incremental checkpoint so Ctrl+C/model failure doesn't lose prior groups.
         file_path.write_text(
             "\n".join(lines) + ("\n" if original.endswith("\n") else ""),
             encoding="utf-8",
@@ -512,15 +518,17 @@ def process_file(file_path, args, model, finished_path, finished):
 
     if not args.retranslate:
         append_finished(finished_path, file_path)
+
     print(f"处理完成：{file_path}")
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Ren'Py rpy 本地 AI 一键翻译（LM Studio / OpenAI Compatible API）"
+        description="Ren'Py rpy 本地 AI 一键翻译（LM Studio / HY-MT 高速模式）"
     )
     p.add_argument(
-        "path", help="Ren'Py 生成的翻译目录，例如 game/tl/schinese"
+        "path",
+        help="Ren'Py 生成的翻译目录，例如 game/tl/schinese",
     )
     p.add_argument(
         "--base-url",
@@ -537,13 +545,19 @@ def parse_args():
         "--batch",
         type=int,
         default=DEFAULT_BATCH,
-        help="每个 API 请求尝试翻译的连续文本条数，默认 8；失败会自动降级单句",
+        help="普通文本每个请求最多翻译多少行，默认 16；推荐 HY-MT 尝试 16~32",
     )
     p.add_argument(
         "--context",
         type=int,
         default=DEFAULT_CONTEXT,
-        help="附带前文的已翻译对话条数，默认 4；0 为关闭",
+        help="额外附带前文英中对照条数，默认 0（最快）；批内连续对白本身已有上下文",
+    )
+    p.add_argument(
+        "--max-batch-chars",
+        type=int,
+        default=DEFAULT_MAX_BATCH_CHARS,
+        help="单个批次最大原文字符数，默认 6000",
     )
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
@@ -567,24 +581,36 @@ def parse_args():
 
 def main():
     args = parse_args()
+
     if args.batch < 1:
         print("--batch 必须 >= 1", file=sys.stderr)
         return 2
     if args.context < 0:
         print("--context 必须 >= 0", file=sys.stderr)
         return 2
+    if args.max_batch_chars < 100:
+        print("--max-batch-chars 必须 >= 100", file=sys.stderr)
+        return 2
 
     args.base_url = normalize_base_url(args.base_url)
     root = Path(args.path)
+
     if not root.exists():
         print(f"目录不存在：{root}", file=sys.stderr)
         return 2
 
     model = detect_model(args.base_url, args.model)
+
     print(f"LM Studio: {args.base_url}")
     print(f"模型: {model}")
     print(f"翻译目录: {root.resolve()}")
-    print(f"批量: {args.batch} 条/请求；前文上下文: {args.context} 条")
+    print(
+        f"高速批量: 最多 {args.batch} 行/请求；"
+        f"额外前文: {args.context} 条；"
+        f"批次字符上限: {args.max_batch_chars}"
+    )
+    print("标签策略: 含 Ren'Py 标签/变量的行自动走安全模式，标签不会发送给模型")
+
     if args.retranslate:
         print("模式: 重新翻译已有中文（仅能恢复到英文原文的行）")
     else:
@@ -593,6 +619,7 @@ def main():
     finished_path = Path("finished_file_list_lmstudio.txt")
     finished = load_finished(finished_path)
     files = find_rpy_files(root)
+
     if not files:
         print("没有找到 .rpy 文件。")
         return 1
